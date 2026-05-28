@@ -189,6 +189,50 @@ class LarkClient:
                 print(f"  [FAIL] 更新 {record_id} 失败: {e}", file=sys.stderr)
             return False
 
+    def verify_fields(self, table_id: str, expected_fields: dict) -> bool:
+        """
+        校验飞书表格的字段 ID 是否与代码中的预期配置一致。
+
+        参数:
+            table_id:       目标 table ID
+            expected_fields: 预期字段映射，格式 {"字段名": "field_id", ...}
+
+        返回:
+            True 表示校验通过（全部匹配），False 表示有 mismatch。
+        """
+        args = [
+            "base", "+field-list",
+            "--base-token", self.base_token,
+            "--table-id", table_id,
+            "--as", "user",
+        ]
+        try:
+            result = self._run_lark(args)
+        except RuntimeError as e:
+            print(f"  [FAIL] 获取字段列表失败: {e}", file=sys.stderr)
+            return False
+
+        actual_fields = result.get("data", {}).get("fields", [])
+        actual_by_id = {f["id"]: f["name"] for f in actual_fields}
+        actual_by_name = {f["name"]: f["id"] for f in actual_fields}
+
+        ok = True
+        for name, fid in expected_fields.items():
+            if fid in actual_by_id:
+                print(f"  [OK]  {name} → {fid}")
+            else:
+                actual_name = actual_by_id.get(fid, "(不存在)")
+                print(f"  [MISSING]  {name} → 预期 {fid}，实际字段名: {actual_name}")
+                ok = False
+
+        # 检查代码中未配置的字段（warning）
+        configured_fids = set(expected_fields.values())
+        for f in actual_fields:
+            if f["id"] not in configured_fids:
+                print(f"  [EXTRA]  字段 \"{f['name']}\" (id={f['id']}) 未在代码中配置")
+
+        return ok
+
 
 def add_common_args(parser: argparse.ArgumentParser, upsert_delay_default: float = 0.8):
     """为 argparse 添加 feishu_sync 共享参数"""

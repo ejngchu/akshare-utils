@@ -379,14 +379,36 @@ def main():
   python feishu_sync.py                         # 增量更新
   python feishu_sync.py --dry-run               # 预览模式
   python feishu_sync.py --force                 # 强制更新所有记录
+  python feishu_sync.py --verify               # 校验字段配置是否匹配
   python feishu_sync.py --rate-limit 1.5        # 自定义写入间隔 1.5s
   python feishu_sync.py --on-error abort         # 遇错立即终止
         """,
     )
     add_common_args(parser, UPSERT_DELAY)
+    parser.add_argument(
+        "--verify", action="store_true",
+        help="仅校验飞书表格字段 ID 与代码配置是否一致，不执行同步"
+    )
     args = parser.parse_args()
 
     setup_signal_handlers()
+
+    if args.verify:
+        from feishu_base import LarkClient
+        client = LarkClient(FEISHU_BASE_TOKEN, UPSERT_DELAY)
+        print("=" * 60)
+        print("  校验飞书表格字段配置")
+        print("=" * 60)
+        print("\n[Watchlist 表]")
+        ok1 = client.verify_fields(WATCHLIST_TABLE_ID, WATCHLIST_FIELD_IDS)
+        print("\n[Holdings 表]")
+        ok2 = client.verify_fields(HOLDINGS_TABLE_ID, HOLDINGS_FIELD_IDS)
+        print("\n" + "=" * 60)
+        if ok1 and ok2:
+            print("  [OK] 字段配置校验通过")
+        else:
+            print("  [FAIL] 字段配置有 mismatch，请检查 feishu_constants.py")
+        sys.exit(0 if (ok1 and ok2) else 1)
 
     try:
         sync(
