@@ -1,0 +1,4 @@
+{
+  "upsert_delay": 0.8,
+  "cache_ttl_seconds": 120
+}

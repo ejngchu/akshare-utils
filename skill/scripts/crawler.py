@@ -3,6 +3,11 @@
 
 可独立 CLI 使用，也可被 feishu_sync.py 导入调用。
 
+特性：
+  - 支持内存缓存（基于 price_cache.json）
+  - TTL 内直接返回缓存数据，减少不必要的网络请求
+  - 缓存时间可配置（默认 2 分钟，见 assets/config.json 的 cache_ttl_seconds）
+
 用法:
     echo '["sz000333","hk00700","015600"]' | python crawler.py
     python -c "import crawler; print(crawler.crawl(['sz000333','hk00700']))"
@@ -12,24 +17,58 @@ import argparse
 import io
 import json
 import sys
+import time as _time
 
 import watchlist
+from feishu_config import (
+    load_price_cache,
+    save_price_cache,
+    is_cache_valid,
+    PRICE_CACHE_PATH,
+)
 
 
-def crawl(codes: list[str], quiet: bool = True) -> list[dict]:
+def crawl(codes: list[str], quiet: bool = True, use_cache: bool = True) -> list[dict]:
     """
     爬取指定代码列表的最新价和涨幅。
 
     参数:
         codes: 代码列表，如 ["sz000333", "hk00700", "015600"]
         quiet: 是否抑制 watchlist 内部 print（默认 True）
+        use_cache: 是否启用缓存（TTL 内直接返回缓存数据，默认 True）
 
     返回:
-        [{code, matched, price, change_pct, name}, ...]
+        [{code, matched, price, change_pct, name, date}, ...]
         其中 change_pct 已格式化为如 "-0.88%" 的字符串
     """
     if not codes:
         return []
+
+    # 规范化输入
+    codes = [c.strip() for c in codes if c.strip()]
+
+    # 检查缓存（TTL 内直接返回缓存数据）
+    if use_cache and is_cache_valid():
+        cached = load_price_cache()
+        cached_prices = cached.get("prices", {})
+        results = []
+        for raw_code in codes:
+            if raw_code in cached_prices:
+                entry = cached_prices[raw_code]
+                results.append(entry)
+            else:
+                # 缓存中没有的代码，标记为未匹配
+                results.append({
+                    "code": raw_code,
+                    "name": raw_code,
+                    "matched": False,
+                    "price": None,
+                    "change_pct": None,
+                    "date": None,
+                })
+        if results and any(r["matched"] for r in results):
+            _log_cache_hit(len([r for r in results if r["matched"]]), len(codes))
+        return results
 
     # 构建 HoldingItem 列表（用缓存名称，后续会被真实名称覆盖）
     items = []
@@ -93,6 +132,7 @@ def crawl(codes: list[str], quiet: bool = True) -> list[dict]:
 
     # 组装结果
     results = []
+    price_map = {}
     for it in items:
         price = watchlist.to_float(it.price)
         # 格式化涨幅为 "-0.88%" 格式
@@ -102,16 +142,34 @@ def crawl(codes: list[str], quiet: bool = True) -> list[dict]:
         else:
             change_pct = None
 
-        results.append({
+        result = {
             "code": it.raw_code,
             "name": it.name,
             "matched": it.matched,
             "price": price,
             "change_pct": change_pct,
             "date": it.date,
-        })
+        }
+        results.append(result)
+
+        # 缓存价格数据
+        if it.matched and price is not None:
+            price_map[it.raw_code] = result
+
+    # 写入缓存
+    if use_cache and price_map:
+        save_price_cache(price_map)
 
     return results
+
+
+def _log_cache_hit(hit_count: int, total_count: int):
+    """打印缓存命中日志"""
+    msg = f"[CACHE] 命中 {hit_count}/{total_count} 条（TTL 内有效）"
+    if hasattr(sys.stderr, "isatty") and sys.stderr.isatty():
+        print(f"[{_time.strftime('%H:%M:%S')}] [INFO] {msg}", file=sys.stderr)
+    else:
+        print(msg, file=sys.stderr)
 
 
 def main():

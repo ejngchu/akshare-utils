@@ -37,6 +37,16 @@ class LarkClient:
     def __init__(self, base_token: str, upsert_delay: float = 0.8):
         self.base_token = base_token
         self.upsert_delay = upsert_delay
+        self._cleanup_files: list[str] = []
+
+    def _cleanup_temp(self):
+        import os as _os
+        for f in self._cleanup_files:
+            try:
+                _os.remove(f)
+            except OSError:
+                pass
+        self._cleanup_files.clear()
 
     def _decode_output(self, data: bytes) -> str:
         """尝试用 UTF-8 解码，回退到 GBK"""
@@ -47,45 +57,78 @@ class LarkClient:
                 continue
         return data.decode("utf-8", errors="replace")
 
+    def _write_json_temp(self, content: str) -> str:
+        """将 JSON 内容写入 CWD 临时文件，返回 @filename 引用"""
+        import os as _os
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False,
+            dir=_os.getcwd(), encoding="utf-8"
+        )
+        tmp.write(content)
+        tmp.close()
+        fname = _os.path.basename(tmp.name)
+        self._cleanup_files.append(fname)
+        return f"@{fname}"
+
     def _run_lark(self, args: list[str], rate_limit: float = None) -> dict:
         """
         调用 lark-cli 并返回解析后的 JSON dict。
         遇到限流时会自动重试一次。
+        Windows 上不使用 shell=True，避免 JSON {} 被 shell 解析破坏。
         """
         if rate_limit is None:
             rate_limit = self.upsert_delay
-        cmd = [_lark_cli] + args
 
-        for attempt in range(2):
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=False,
-                    timeout=60,
-                )
-            except subprocess.TimeoutExpired:
-                raise RuntimeError(f"lark-cli 超时: {' '.join(cmd)}")
-            except FileNotFoundError:
-                raise RuntimeError(
-                    f"未找到 {_lark_cli}，请确保已安装: npm install -g @lark-opdev/lark-cli"
-                )
+        # 将 inline --json 参数转为临时文件引用（Windows 避免 shell 破坏 {}）
+        safe_args = []
+        skip_next = False
+        for a in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if a == "--json":
+                safe_args.append(a)
+                continue
+            # 紧跟 --json 后的非 @ 开头的参数是被引用的 JSON 内容
+            if safe_args and safe_args[-1] == "--json" and not a.startswith("@"):
+                safe_args.append(self._write_json_temp(a))
+            else:
+                safe_args.append(a)
 
-            stdout = self._decode_output(proc.stdout)
-            stderr = self._decode_output(proc.stderr)
+        try:
+            for attempt in range(2):
+                try:
+                    proc = subprocess.run(
+                        [_lark_cli] + safe_args,
+                        capture_output=True,
+                        text=False,
+                        timeout=60,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError(f"lark-cli 超时: {' '.join(safe_args)}")
+                except FileNotFoundError:
+                    raise RuntimeError(
+                        f"未找到 {_lark_cli}，请确保已安装: npm install -g @lark-opdev/lark-cli"
+                    )
 
-            if proc.returncode != 0:
-                err = stderr.strip() or "(no stderr)"
-                is_rate_limit = (proc.returncode == 429 or "rate limit" in err.lower())
-                if is_rate_limit and attempt == 0:
-                    time.sleep(rate_limit * 2)
-                    continue
-                raise RuntimeError(f"lark-cli 失败 (exit={proc.returncode}): {err}")
+                stdout = self._decode_output(proc.stdout)
+                stderr = self._decode_output(proc.stderr)
 
-            try:
-                return json.loads(stdout)
-            except json.JSONDecodeError as e:
-                raise RuntimeError(f"lark-cli 输出解析失败: {e}\n输出: {stdout[:500]}")
+                if proc.returncode != 0:
+                    err = stderr.strip() or "(no stderr)"
+                    is_rate_limit = (proc.returncode == 429 or "rate limit" in err.lower() or "太频繁" in err)
+                    if is_rate_limit and attempt == 0:
+                        time.sleep(rate_limit * 2)
+                        continue
+                    raise RuntimeError(f"lark-cli 失败 (exit={proc.returncode}): {err}")
+
+                try:
+                    return json.loads(stdout)
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(f"lark-cli 输出解析失败: {e}\n输出: {stdout[:500]}")
+        finally:
+            self._cleanup_temp()
 
     def get_records(self, table_id: str, field_ids: dict, page_size: int = 200) -> list[dict]:
         """
@@ -138,6 +181,66 @@ class LarkClient:
             offset += page_size
 
         return records
+
+    def upsert_batch(
+        self,
+        table_id: str,
+        records: list[dict],
+        dry_run: bool = False,
+        verbose: bool = True,
+    ) -> tuple[int, int]:
+        """
+        逐条 upsert 记录（使用 lark-cli +record-upsert）。
+        `+record-batch-update` 是同值批量（同一 patch 应用到多条记录），不适合我们的异值场景。
+
+        参数:
+            table_id:  目标 table ID
+            records:   [{"record_id": str, "fields": {field_id: value}}, ...]
+            dry_run:   是否仅预览
+            verbose:   是否打印日志
+
+        返回:
+            (成功数, 失败数)
+        """
+        if not records:
+            return 0, 0
+
+        if dry_run:
+            if verbose:
+                for r in records:
+                    print(f"  [DRY-RUN] 更新 {r['record_id']}: {json.dumps(r['fields'], ensure_ascii=False)}")
+            return len(records), 0
+
+        ok_count, fail_count = 0, 0
+        for i, rec in enumerate(records):
+            if _interrupted:
+                if verbose:
+                    print("  [INTERRUPT] 收到中断信号，停止写入", file=sys.stderr)
+                break
+            fields = rec.get("fields", {})
+            if not fields:
+                ok_count += 1
+                continue
+            cell_json = json.dumps(fields, ensure_ascii=False)
+            args = [
+                "base", "+record-upsert",
+                "--base-token", self.base_token,
+                "--table-id", table_id,
+                "--record-id", rec["record_id"],
+                "--json", cell_json,
+                "--as", "user",
+            ]
+            try:
+                self._run_lark(args)
+                ok_count += 1
+                if i < len(records) - 1:
+                    time.sleep(self.upsert_delay)
+            except RuntimeError as e:
+                if verbose:
+                    print(f"  [FAIL] {rec['record_id']}: {e}", file=sys.stderr)
+                fail_count += 1
+
+        return ok_count, fail_count
 
     def upsert_record(
         self,
